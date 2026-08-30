@@ -1,0 +1,141 @@
+Route the real Node extension host around cp.fork() on iOS.
+
+iOS denies fork()/posix_spawn() to third-party processes outright, at the
+sandbox-profile level -- unrelated to JIT or code signing, and with no known
+workaround short of a full jailbreak. cp.fork() is exactly how this file
+normally starts the extension host, so it can't run as-is.
+
+The exthost protocol itself doesn't require a literal parent/child
+relationship, though: on POSIX, when _canSendSocket is false, the only
+thing that happens is a plain net.Server listens on a Unix-domain-socket
+path (createRandomIPCHandle()) and whatever process connects to it is
+treated as the extension host. This patch (a) forces _canSendSocket off
+whenever IPADVSCODE_NO_FORK is set, so that path is always taken, and
+(b) replaces the cp.fork() call with writing the launch parameters
+(bootstrapForkPath/args/env) to a JSON file in the shared App Group
+container instead. A second app extension (ExtensionHostRuntime, launched
+by iOS itself, not by us) reads that file and execs bootstrap-fork.js on
+its own, connecting to the same socket. See ipad-vscode/README.md and
+ipad-vscode/Sources/ExtensionHostRuntime for the other half of this.
+
+Known gap: since there's no real ChildProcess handle on this path,
+shortenReconnectionGraceTimeIfNecessary() and the fd-passing branch of
+acceptReconnection() are inert, and the exit/error lifecycle hooks don't
+fire for this process the way they do for a real fork. Not addressed here.
+
+Only takes effect when IPADVSCODE_NO_FORK is set; behavior on every other
+platform is unchanged.
+
+Index: code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/server/node/extensionHostConnection.ts
++++ code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
+@@ -5,6 +5,8 @@
+ 
+ import * as cp from 'child_process';
+ import * as net from 'net';
++import * as fs from 'fs';
++import * as path from 'path';
+ import { VSBuffer } from '../../base/common/buffer.js';
+ import { Emitter, Event } from '../../base/common/event.js';
+ import { Disposable, DisposableStore, toDisposable } from '../../base/common/lifecycle.js';
+@@ -127,7 +129,11 @@
+ 		@IConfigurationService private readonly _configurationService: IConfigurationService
+ 	) {
+ 		super();
+-		this._canSendSocket = (!isWindows || !this._environmentService.args['socket-path']);
++		// iOS: never use the fd-passing path -- it requires a real child_process
++		// IPC channel from a literal fork(), which iOS denies to third-party
++		// processes. Force the named-pipe path instead; see IPADVSCODE_NO_FORK
++		// in start() below.
++		this._canSendSocket = (!isWindows || !this._environmentService.args['socket-path']) && !process.env['IPADVSCODE_NO_FORK'];
+ 		this._disposed = false;
+ 		this._remoteAddress = remoteAddress;
+ 		this._extensionHostProcess = null;
+@@ -287,30 +293,62 @@
+ 			if (this._configurationService.getValue<boolean>('extensions.supportNodeGlobalNavigator')) {
+ 				args.push('--supportGlobalNavigator');
+ 			}
+-			this._extensionHostProcess = cp.fork(FileAccess.asFileUri('bootstrap-fork').fsPath, args, opts);
+-			const pid = this._extensionHostProcess.pid;
+-			this._log(`<${pid}> Launched Extension Host Process.`);
+-
+-			// Catch all output coming from the extension host process
+-			this._extensionHostProcess.stdout!.setEncoding('utf8');
+-			this._extensionHostProcess.stderr!.setEncoding('utf8');
+-			const onStdout = Event.fromNodeEventEmitter<string>(this._extensionHostProcess.stdout!, 'data');
+-			const onStderr = Event.fromNodeEventEmitter<string>(this._extensionHostProcess.stderr!, 'data');
+-			this._register(onStdout((e) => this._log(`<${pid}> ${e}`)));
+-			this._register(onStderr((e) => this._log(`<${pid}><stderr> ${e}`)));
+-
+-			// Lifecycle
+-			this._extensionHostProcess.on('error', (err) => {
+-				this._logError(`<${pid}> Extension Host Process had an error`);
+-				this._logService.error(err);
+-				this._cleanResources();
+-			});
+-
+-			this._extensionHostProcess.on('exit', (code: number, signal: string) => {
+-				this._extensionHostStatusService.setExitInfo(this._reconnectionToken, { code, signal });
+-				this._log(`<${pid}> Extension Host Process exited with code: ${code}, signal: ${signal}.`);
+-				this._cleanResources();
+-			});
++
++			if (process.env['IPADVSCODE_NO_FORK']) {
++				// iOS denies fork()/posix_spawn() to third-party processes
++				// outright -- there is no ChildProcess to create here. Instead,
++				// hand the launch parameters to a second, independently
++				// iOS-launched process (the ExtensionHostRuntime app extension)
++				// via a file in the shared App Group container. That process
++				// execs bootstrap-fork.js itself and connects to the same named
++				// pipe `extHostNamedPipeServer` above is listening on -- the
++				// exthost protocol only ever needs a connected socket, not a
++				// literal parent/child relationship. See
++				// ipad-vscode/Sources/ExtensionHostRuntime and
++				// ipad-vscode/Sources/Shared/ExtensionHostLaunchRequest.swift.
++				const sharedContainer = process.env['IPADVSCODE_SHARED_CONTAINER'];
++				if (!sharedContainer) {
++					throw new Error('IPADVSCODE_NO_FORK is set but IPADVSCODE_SHARED_CONTAINER is missing');
++				}
++				const launchRequest = {
++					bootstrapForkPath: FileAccess.asFileUri('bootstrap-fork').fsPath,
++					args,
++					env,
++				};
++				fs.writeFileSync(path.join(sharedContainer, 'exthost-launch-request.json'), JSON.stringify(launchRequest));
++				this._log('Wrote extension host launch request for ExtensionHostRuntime (no local fork on iOS).');
++				// this._extensionHostProcess stays null on this path. That
++				// means shortenReconnectionGraceTimeIfNecessary() and the
++				// fd-passing branch of acceptReconnection() are inert here --
++				// a known gap, see ipad-vscode/README.md -- and the
++				// error/exit lifecycle hooks below don't apply since there's
++				// no local ChildProcess to listen to.
++			} else {
++				this._extensionHostProcess = cp.fork(FileAccess.asFileUri('bootstrap-fork').fsPath, args, opts);
++				const pid = this._extensionHostProcess.pid;
++				this._log(`<${pid}> Launched Extension Host Process.`);
++
++				// Catch all output coming from the extension host process
++				this._extensionHostProcess.stdout!.setEncoding('utf8');
++				this._extensionHostProcess.stderr!.setEncoding('utf8');
++				const onStdout = Event.fromNodeEventEmitter<string>(this._extensionHostProcess.stdout!, 'data');
++				const onStderr = Event.fromNodeEventEmitter<string>(this._extensionHostProcess.stderr!, 'data');
++				this._register(onStdout((e) => this._log(`<${pid}> ${e}`)));
++				this._register(onStderr((e) => this._log(`<${pid}><stderr> ${e}`)));
++
++				// Lifecycle
++				this._extensionHostProcess.on('error', (err) => {
++					this._logError(`<${pid}> Extension Host Process had an error`);
++					this._logService.error(err);
++					this._cleanResources();
++				});
++
++				this._extensionHostProcess.on('exit', (code: number, signal: string) => {
++					this._extensionHostStatusService.setExitInfo(this._reconnectionToken, { code, signal });
++					this._log(`<${pid}> Extension Host Process exited with code: ${code}, signal: ${signal}.`);
++					this._cleanResources();
++				});
++			}
+ 
+ 			if (extHostNamedPipeServer) {
+ 				extHostNamedPipeServer.on('connection', (socket) => {
