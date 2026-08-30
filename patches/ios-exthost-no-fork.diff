@@ -139,3 +139,12 @@ Index: code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
  
  			if (extHostNamedPipeServer) {
  				extHostNamedPipeServer.on('connection', (socket) => {
+@@ -325,7 +363,7 @@
+ 						this._connectionData = null;
+ 					}
+ 				};
+-				this._extensionHostProcess.on('message', messageListener);
++				this._extensionHostProcess!.on('message', messageListener);
+ 			}
+ 
+ 		} catch (error) {
