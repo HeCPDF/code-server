@@ -104,7 +104,7 @@ Index: code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
  		this._onClose.fire(undefined);
  	}
  
-@@ -287,30 +302,75 @@
+@@ -287,30 +302,92 @@
  			if (this._configurationService.getValue<boolean>('extensions.supportNodeGlobalNavigator')) {
  				args.push('--supportGlobalNavigator');
  			}
@@ -147,10 +147,27 @@ Index: code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
 +				// run correctly regardless of whether they were forked or
 +				// are executing in a Worker. See this patch's header for
 +				// the worker_threads-support caveat (unverified on device).
++				// Node's worker_threads only accept a curated subset of
++				// V8/Node CLI flags via execArgv -- unlike a real forked
++				// child process, which accepts any flag. Confirmed as a
++				// real failure via a captured node-stdio.log, not assumed:
++				// "ERR_WORKER_INVALID_EXEC_ARGV: Initiated Worker with
++				// invalid execArgv flags: --max-old-space-size=256" --
++				// which was silently taking the whole extension host down
++				// with it ("Failed to start extension host process").
++				// Strip that flag out of the inherited execArgv and
++				// translate it to the Worker-native equivalent
++				// (resourceLimits.maxOldGenerationSizeMb) instead.
++				const workerExecArgv = (opts.execArgv ?? []).filter(a => !a.startsWith('--max-old-space-size'));
++				const maxOldSpaceSizeArg = (opts.execArgv ?? []).find(a => a.startsWith('--max-old-space-size'));
++				const maxOldGenerationSizeMb = maxOldSpaceSizeArg
++					? Number(maxOldSpaceSizeArg.split('=')[1])
++					: undefined;
 +				const worker = new Worker(FileAccess.asFileUri('bootstrap-fork').fsPath, {
 +					argv: args,
 +					env,
-+					execArgv: opts.execArgv,
++					execArgv: workerExecArgv,
++					resourceLimits: maxOldGenerationSizeMb ? { maxOldGenerationSizeMb } : undefined,
 +					stdout: true,
 +					stderr: true,
 +				});
@@ -204,7 +221,7 @@ Index: code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
  
  			if (extHostNamedPipeServer) {
  				extHostNamedPipeServer.on('connection', (socket) => {
-@@ -325,7 +385,7 @@
+@@ -325,7 +402,7 @@
  						this._connectionData = null;
  					}
  				};
