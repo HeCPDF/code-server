@@ -57,6 +57,27 @@ async function entry(): Promise<void> {
     return openInExistingInstance(args, socketPath)
   }
 
+  if (process.env.IPADVSCODE_NO_FORK) {
+    // iOS denies fork()/posix_spawn() to third-party processes outright (the
+    // same sandbox wall that ios-exthost-no-fork.diff routes the extension
+    // host around). wrapper.start() here would call ParentProcess.spawn(),
+    // which does cp.fork(entry.js) and then waits up to 10s for an IPC
+    // handshake message from that "child" -- on iOS the fork never produces
+    // a real child, the handshake always times out ("error timed out" in
+    // the logs), and the timeout's rejection propagates back to
+    // wrapper.exit(), which calls process.exit(1) and kills the only Node
+    // process this app has. Run the server directly in this process
+    // instead, mirroring the isChild(wrapper) branch above but without a
+    // handshake, since args are already parsed locally. This forfeits
+    // code-server's own self-update/relaunch support (SIGUSR1/SIGUSR2, the
+    // update-triggered relaunch message), which doesn't apply anyway since
+    // there's no update mechanism in a static app bundle.
+    wrapper.preventExit()
+    const server = await runCodeServer(args)
+    wrapper.onDispose(() => server.dispose())
+    return
+  }
+
   return wrapper.start(args)
 }
 
