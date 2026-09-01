@@ -52,10 +52,26 @@ events. Not addressed here.
 Only takes effect when IPADVSCODE_NO_FORK is set; behavior on every other
 platform is unchanged.
 
+Update (2026-09-01): the same ERR_WORKER_INVALID_EXEC_ARGV failure hit
+again, for a different pair of flags, once real V8 JIT started running
+on Simulator (see ipad-vscode's NodeRuntimeController.swift and
+README.md's JIT section) -- "Initiated Worker with invalid execArgv
+flags: --no-jitless, --no-expose-wasm", same "Failed to start
+extension host process" symptom, confirmed via a real captured
+node-stdio.log, not assumed. Extended the execArgv filter to also
+strip --jitless/--no-jitless/--expose-wasm/--no-expose-wasm. Unlike
+--max-old-space-size, these have no Worker-native resourceLimits
+equivalent to translate to, and don't need one: jitless/expose_wasm
+are process-wide V8 flags, already applied once via
+V8::SetFlagsFromCommandLine() when this main process started, and
+every Isolate the process creates afterwards -- including a Worker's
+-- inherits that same global flag state automatically. Dropped, not
+translated.
+
 Index: code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
 ===================================================================
---- code-server.orig/lib/vscode/src/vs/server/node/extensionHostConnection.ts
-+++ code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
+--- code-server.orig/lib/vscode/src/vs/server/node/extensionHostConnection.ts	2026-09-01 18:56:43.321179938 +0000
++++ code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts	2026-09-01 18:56:43.323407234 +0000
 @@ -5,6 +5,7 @@
  
  import * as cp from 'child_process';
@@ -104,7 +120,7 @@ Index: code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
  		this._onClose.fire(undefined);
  	}
  
-@@ -287,30 +302,92 @@
+@@ -287,30 +302,110 @@
  			if (this._configurationService.getValue<boolean>('extensions.supportNodeGlobalNavigator')) {
  				args.push('--supportGlobalNavigator');
  			}
@@ -158,7 +174,25 @@ Index: code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
 +				// Strip that flag out of the inherited execArgv and
 +				// translate it to the Worker-native equivalent
 +				// (resourceLimits.maxOldGenerationSizeMb) instead.
-+				const workerExecArgv = (opts.execArgv ?? []).filter(a => !a.startsWith('--max-old-space-size'));
++				//
++				// Same real failure, confirmed the same way (a captured
++				// node-stdio.log, not assumed), hit again once the main
++				// process started passing --no-jitless/--no-expose-wasm on
++				// Simulator (see ipad-vscode's NodeRuntimeController.swift):
++				// "ERR_WORKER_INVALID_EXEC_ARGV: Initiated Worker with
++				// invalid execArgv flags: --no-jitless, --no-expose-wasm".
++				// Unlike --max-old-space-size, these have no Worker-native
++				// resourceLimits equivalent to translate to -- but they
++				// also don't need one: jitless/expose_wasm are process-wide
++				// V8 flags (v8::internal::FLAG_jitless and friends), already
++				// applied once via V8::SetFlagsFromCommandLine() when this
++				// main process started, and every Isolate this process
++				// creates afterwards -- including a Worker's -- inherits
++				// that same global flag state automatically. Re-passing
++				// them on the Worker's own execArgv was never necessary;
++				// dropped here rather than translated.
++				const disallowedExecArgvPrefixes = ['--max-old-space-size', '--jitless', '--no-jitless', '--expose-wasm', '--no-expose-wasm'];
++				const workerExecArgv = (opts.execArgv ?? []).filter(a => !disallowedExecArgvPrefixes.some(p => a.startsWith(p)));
 +				const maxOldSpaceSizeArg = (opts.execArgv ?? []).find(a => a.startsWith('--max-old-space-size'));
 +				const maxOldGenerationSizeMb = maxOldSpaceSizeArg
 +					? Number(maxOldSpaceSizeArg.split('=')[1])
@@ -221,7 +255,7 @@ Index: code-server/lib/vscode/src/vs/server/node/extensionHostConnection.ts
  
  			if (extHostNamedPipeServer) {
  				extHostNamedPipeServer.on('connection', (socket) => {
-@@ -325,7 +402,7 @@
+@@ -325,7 +420,7 @@
  						this._connectionData = null;
  					}
  				};
