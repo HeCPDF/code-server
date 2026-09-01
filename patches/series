@@ -26,3 +26,4 @@ copilot.diff
 app-name.diff
 csp-hashes.diff
 ios-exthost-no-fork.diff
+ios-command-bridge.diff
