@@ -179,6 +179,22 @@ function decodeMessage(message: Buffer): { header: unknown[]; body: unknown } {
  */
 export interface IPCRawTransport {
   send(data: Buffer): void
+  /**
+   * A distinct, out-of-band JSON text push -- NOT part of the
+   * request/response RPC framing `send(_:)` carries. Real vscode has no
+   * direct equivalent (Electron's `webContents.send(channel, data)` can
+   * push to the renderer any time, unprompted, over the SAME `ipcMain`
+   * transport its RPC replies use, since Electron IPC is channel-tagged
+   * at the transport level); here, since `send(_:)`'s binary frames are
+   * exactly vscode's own untagged wire format, an out-of-band push needs
+   * its own distinguishable shape instead -- a plain JSON *text* frame,
+   * which the Swift side (VSCodeIPCWebSocketRelay) already treats as a
+   * different case from the binary RPC stream. See the `menubar` channel
+   * (routes/ipadVSCodeIpc.ts) for the first real use: forwarding
+   * `updateMenubar`'s `IMenubarData` payload to the native menu bar,
+   * which isn't a reply to any pending RPC call.
+   */
+  sendText(text: string): void
   onMessage(listener: (data: Buffer) => void): void
   onClose(listener: () => void): void
 }
@@ -211,9 +227,21 @@ export class PortChannelServer {
     this.sendResponse([ResponseType.Initialize])
   }
 
-  static create(transport: IPCRawTransport, channels: ReadonlyMap<string, IServerChannel>): PortChannelServer {
+  /**
+   * `makeChannels` is a factory, not a static map, specifically so a
+   * channel implementation can capture `transport` itself (via the
+   * closure) and use `transport.sendText(...)` for out-of-band pushes
+   * (see `IPCRawTransport.sendText`'s doc comment) -- each WebSocket
+   * connection gets its own fresh channel instances bound to its own
+   * transport, rather than one shared instance with no way to know
+   * which connection to push to.
+   */
+  static create(
+    transport: IPCRawTransport,
+    makeChannels: (transport: IPCRawTransport) => ReadonlyMap<string, IServerChannel>,
+  ): PortChannelServer {
     const server = new PortChannelServer(transport)
-    for (const [name, channel] of channels) {
+    for (const [name, channel] of makeChannels(transport)) {
       server.channels.set(name, channel)
     }
     return server
