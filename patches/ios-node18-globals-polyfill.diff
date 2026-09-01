@@ -1,0 +1,94 @@
+Polyfill missing Node-18-only globals in bootstrap-fork.ts's own process,
+before it loads anything else -- this embedded nodejs-mobile runtime is
+Node 18.20.4, which is missing two globals vscode's own code and its
+bundled dependencies reference unconditionally at module-load time:
+
+- `File`: a default global only since Node 20 (Node 18 exposes it only
+  as a named export of node:buffer, since 18.13.0).
+- `crypto` (Web Crypto API): a default global only since Node 19 (Node
+  18 exposes the exact same interface -- confirmed against Node's own
+  v18.20.4 source, lib/internal/crypto/webcrypto.js, which has both
+  randomUUID and getRandomValues -- only as node:crypto's named
+  `webcrypto` export).
+
+Both were found the same way, one after the other, via a real captured
+node-stdio.log from an actual Simulator run -- not guessed:
+- `File`: vscode's bundled `undici` dependency (pulled in transitively
+  by the extension host's own HTTP client wiring, e.g.
+  @vscode/proxy-agent) references the global `File` unconditionally at
+  module-load time (node_modules/undici/lib/web/webidl/index.js),
+  crashing every single extension host connection attempt with
+  "ReferenceError: File is not defined" / "Extension Host Worker exited
+  with code: 1".
+- `crypto`: once the `File` fix let the extension host get further,
+  the *next* connection attempt crashed instead with "ReferenceError:
+  crypto is not defined", stack-traced into
+  vs/workbench/api/node/extensionHostProcess.js -- vscode's own
+  vs/base/common/uuid.ts references the bare `crypto` global
+  unconditionally in generateUuid's module-load-time IIFE (`typeof
+  crypto.randomUUID === 'function'`), and that module is pulled in
+  early enough in the extension host's own bootstrap chain to hit this
+  before anything else runs.
+
+Both guarded (`typeof globalThis.X === 'undefined'`) so they're a no-op
+on any Node build where the global already exists (Node 20+/19+, or a
+real Electron/desktop build) -- this only ever does anything on this
+specific embedded, older-Node mobile runtime.
+
+Verified the same way every other patch in this project is: the
+intended edits were applied to a real copy of the pinned vscode
+commit's source (08d4889f9ec4a1685d257b9b95de036c8e1ce1e5) and diffed
+programmatically (rather than hand-writing hunk headers), then
+confirmed to apply with `patch -p1 --fuzz=0` (zero tolerance for
+near-miss context) with the resulting file byte-identical to the
+intended target. Not run through `tsc` for real (no local vscode build
+environment in this pipeline) -- code-server's own Build CI (which does
+build vscode for real) is the actual verification for that.
+
+Index: code-server/lib/vscode/src/bootstrap-fork.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/bootstrap-fork.ts	2026-09-01 17:40:10.952412561 +0000
++++ code-server/lib/vscode/src/bootstrap-fork.ts	2026-09-01 17:40:10.954351558 +0000
+@@ -222,6 +222,42 @@
+ 	terminateWhenParentTerminates();
+ }
+ 
++// iOS: this embedded nodejs-mobile runtime is Node 18.20.4, which has
++// no global `File` (added as a default global only in Node 20 -- Node
++// 18 exposes it only as a named export of node:buffer, since 18.13.0).
++// vscode's bundled `undici` dependency (loaded transitively by the
++// extension host's own HTTP client wiring, e.g. @vscode/proxy-agent)
++// references the global `File` unconditionally at module-load time
++// (node_modules/undici/lib/web/webidl/index.js), crashing this whole
++// Worker with "ReferenceError: File is not defined" before it can even
++// finish loading -- confirmed via a real captured node-stdio.log
++// ("Extension Host Worker had an error" / "exited with code: 1" on
++// every single connection attempt), not guessed. Harmless everywhere
++// else (only applies when the global is actually missing).
++if (typeof (globalThis as any).File === 'undefined') {
++	(globalThis as any).File = (await import('node:buffer')).File;
++}
++
++// iOS: same embedded-Node-18.20.4 gap as the `File` polyfill just above,
++// this time for the global `crypto` (Web Crypto API) -- unflagged as a
++// default global only since Node 19; Node 18 exposes the same interface
++// (confirmed against Node's own v18.20.4 source,
++// lib/internal/crypto/webcrypto.js, which has both randomUUID and
++// getRandomValues) only via node:crypto's named `webcrypto` export.
++// vscode's own vs/base/common/uuid.ts references the bare `crypto`
++// global unconditionally in generateUuid's module-load-time IIFE
++// (`typeof crypto.randomUUID === 'function'`), and that module is
++// pulled in early enough in the extension host's own bootstrap chain
++// that it crashed the Worker with "ReferenceError: crypto is not
++// defined" the moment the File bug above stopped masking it --
++// confirmed via a real captured node-stdio.log
++// (vs/workbench/api/node/extensionHostProcess.js in the stack trace),
++// not guessed. Harmless everywhere else (only applies when the global
++// is actually missing).
++if (typeof (globalThis as any).crypto === 'undefined') {
++	(globalThis as any).crypto = (await import('node:crypto')).webcrypto;
++}
++
+ // Bootstrap ESM
+ await bootstrapESM();
+ 

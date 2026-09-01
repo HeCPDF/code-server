@@ -27,4 +27,4 @@ app-name.diff
 csp-hashes.diff
 ios-exthost-no-fork.diff
 ios-command-bridge.diff
-ios-file-global-polyfill.diff
+ios-node18-globals-polyfill.diff
