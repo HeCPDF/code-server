@@ -1,0 +1,79 @@
+Expose a real, trusted command-execution bridge for the native iOS host
+app to call, instead of it having to simulate keybindings.
+
+ipad-vscode's native iPadOS-26 menu bar (Save/Undo/Redo/Find/Command
+Palette/etc. -- see ipad-vscode/Sources/App/iPadVSCodeApp.swift) needs a
+way to actually trigger these vscode commands from outside the webview
+when a menu item is clicked with no physical key involved. The only
+mechanism tried first (see ipad-vscode git history) was dispatching a
+synthetic KeyboardEvent that mimics the real keybinding -- but vscode's
+own keybinding service listens for real `keydown` DOM events, and
+whether it filters on `event.isTrusted` (false for anything
+JS-dispatched) was an open, unverified question with no clean way to
+answer short of shipping it and finding out. Even setting that aside, it
+has a second real problem: simulating a *keybinding* only works for
+whatever key the command happens to be bound to at that moment -- if the
+user remaps it in their own keybindings.json, the native menu item
+would silently send the wrong (now-stale) keystroke.
+
+This patch sidesteps both problems by not simulating input at all.
+`Workbench.startup()` (workbench.ts) already resolves `ICommandService`
+via its `instantiationService.invokeFunction(accessor => ...)` block --
+this adds `accessor.get(ICommandService)` there too and exposes
+`(mainWindow as any).__ipadVSCodeExecuteCommand = (commandId, ...args) =>
+commandService.executeCommand(commandId, ...args)`. The native side then
+calls `window.__ipadVSCodeExecuteCommand('workbench.action.files.save')`
+via WKWebView's `evaluateJavaScript` -- itself a trusted native-to-JS
+call, nothing to do with the DOM input-event trust model at all -- which
+is a completely ordinary function call through the same ICommandService
+every other trusted caller inside the workbench already uses. Invoking
+by command ID also means it keeps working correctly regardless of
+whatever key (if any) the user has that command bound to, since it never
+goes through the keybinding-to-command lookup in the first place.
+
+Verified the same way ios-exthost-no-fork.diff was: the intended edits
+were applied to a real copy of the pinned vscode commit's source
+(08d4889f9ec4a1685d257b9b95de036c8e1ce1e5) and diffed programmatically
+rather than hand-writing hunk headers, then confirmed to apply with
+`patch -p1 --fuzz=0` (zero tolerance for near-miss context) with the
+resulting file byte-identical to the intended target. Not run through
+`tsc` for real (no local vscode build environment in this pipeline).
+
+Index: code-server/lib/vscode/src/vs/workbench/browser/workbench.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/browser/workbench.ts
++++ code-server/lib/vscode/src/vs/workbench/browser/workbench.ts
+@@ -39,6 +39,7 @@
+ import { Layout } from './layout.js';
+ import { IHostService } from '../services/host/browser/host.js';
+ import { IDialogService } from '../../platform/dialogs/common/dialogs.js';
++import { ICommandService } from '../../platform/commands/common/commands.js';
+ import { mainWindow } from '../../base/browser/window.js';
+ import { PixelRatio } from '../../base/browser/pixelRatio.js';
+ import { IHoverService, WorkbenchHoverDelegate } from '../../platform/hover/browser/hover.js';
+@@ -144,9 +145,26 @@
+ 				const hostService = accessor.get(IHostService);
+ 				const hoverService = accessor.get(IHoverService);
+ 				const dialogService = accessor.get(IDialogService);
++				const commandService = accessor.get(ICommandService);
+ 				const notificationService = accessor.get(INotificationService) as NotificationService;
+ 				const markdownRendererService = accessor.get(IMarkdownRendererService);
+
++				// iPadVSCode: expose a real, trusted command-execution bridge
++				// for the native host app to call (via WKWebView's
++				// evaluateJavaScript, itself a trusted native->JS call --
++				// nothing to do with a synthetic/untrusted DOM input event).
++				// Lets the native menu bar invoke a command directly by ID
++				// instead of simulating the keybinding that would normally
++				// trigger it, which has two real advantages: it can't be
++				// silently ignored by isTrusted-style input filtering (there
++				// is no synthetic input event at all, just a normal function
++				// call through the same ICommandService any other trusted
++				// caller inside the workbench uses), and it keeps working
++				// correctly even if the user has remapped the command's
++				// keybinding in their own keybindings.json, since it never
++				// goes through the keybinding-to-command lookup at all.
++				(mainWindow as any).__ipadVSCodeExecuteCommand = (commandId: string, ...args: unknown[]) => commandService.executeCommand(commandId, ...args);
++
+ 				// Set code block renderer for markdown rendering
+ 				markdownRendererService.setDefaultCodeBlockRenderer(instantiationService.createInstance(EditorMarkdownCodeBlockRenderer));
