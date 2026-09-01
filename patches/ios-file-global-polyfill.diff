@@ -1,0 +1,57 @@
+Polyfill the global `File` class in bootstrap-fork.ts's own process, before
+it loads anything else -- this embedded nodejs-mobile runtime is Node
+18.20.4, which has no global `File` (a default global only since Node 20;
+Node 18 exposes it only as a named export of `node:buffer`, since 18.13.0).
+
+Confirmed via a real captured node-stdio.log, not guessed: every single
+extension host connection attempt logged
+"[ExtensionHostConnection] Extension Host Worker had an error" immediately
+followed by "ReferenceError [Error]: File is not defined" at
+node_modules/undici/lib/web/webidl/index.js:537, then "Extension Host
+Worker exited with code: 1" -- vscode's bundled `undici` dependency
+(pulled in transitively by the extension host's own HTTP client wiring,
+e.g. `@vscode/proxy-agent`, loaded from `bootstrap-fork.js`) references the
+global `File` unconditionally at module-load time. This was blocking the
+extension host from starting at all, on every attempt, once the separate
+EADDRINUSE bug (ipad-vscode's own NodeRuntimeController.swift fix) stopped
+masking it.
+
+Guarded (`typeof globalThis.File === 'undefined'`) so it's a no-op on any
+Node build where `File` already exists as a global (Node 20+, or a real
+Electron/desktop build) -- this only ever does anything on this specific
+embedded, older-Node mobile runtime.
+
+Verified the same way every other patch in this project is: the intended
+edit was applied to a real copy of the pinned vscode commit's source
+(08d4889f9ec4a1685d257b9b95de036c8e1ce1e5) and diffed programmatically
+(rather than hand-writing hunk headers), then confirmed to apply with
+`patch -p1 --fuzz=0` (zero tolerance for near-miss context) with the
+resulting file byte-identical to the intended target. Not run through
+`tsc` for real (no local vscode build environment in this pipeline).
+
+Index: code-server/lib/vscode/src/bootstrap-fork.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/bootstrap-fork.ts
++++ code-server/lib/vscode/src/bootstrap-fork.ts
+@@ -222,6 +222,22 @@
+ 	terminateWhenParentTerminates();
+ }
+
++// iOS: this embedded nodejs-mobile runtime is Node 18.20.4, which has
++// no global `File` (added as a default global only in Node 20 -- Node
++// 18 exposes it only as a named export of node:buffer, since 18.13.0).
++// vscode's bundled `undici` dependency (loaded transitively by the
++// extension host's own HTTP client wiring, e.g. @vscode/proxy-agent)
++// references the global `File` unconditionally at module-load time
++// (node_modules/undici/lib/web/webidl/index.js), crashing this whole
++// Worker with "ReferenceError: File is not defined" before it can even
++// finish loading -- confirmed via a real captured node-stdio.log
++// ("Extension Host Worker had an error" / "exited with code: 1" on
++// every single connection attempt), not guessed. Harmless everywhere
++// else (only applies when the global is actually missing).
++if (typeof (globalThis as any).File === 'undefined') {
++	(globalThis as any).File = (await import('node:buffer')).File;
++}
++
+ // Bootstrap ESM
+ await bootstrapESM();
