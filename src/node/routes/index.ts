@@ -19,6 +19,7 @@ import type { WebsocketRequest } from "../wsRouter"
 import * as domainProxy from "./domainProxy"
 import { errorHandler, wsErrorHandler } from "./errors"
 import * as health from "./health"
+import * as ipadVSCodeIpc from "./ipadVSCodeIpc"
 import * as login from "./login"
 import * as logout from "./logout"
 import * as pathProxy from "./pathProxy"
@@ -153,6 +154,10 @@ export const register = async (
 
   app.router.use("/healthz", health.router)
   app.wsRouter.use("/healthz", health.wsRouter.router)
+
+  // See routes/ipadVSCodeIpc.ts's own doc comment.
+  app.router.use("/ipad-vscode-ipc", ipadVSCodeIpc.router)
+  app.wsRouter.use("/ipad-vscode-ipc", ipadVSCodeIpc.wsRouter.router)
 
   if (args.auth === AuthType.Password) {
     app.router.use("/login", login.router)
